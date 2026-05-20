@@ -12,3 +12,5 @@ App PHP em arquivo unico para estimar consumo antes de rodar tarefas no Codex.
 - Active: marcado
 
 O webhook atualiza o diretorio `C:\xampp\htdocs\site\tokens` com `git fetch` e `git pull --ff-only` na branch `main`.
+
+Teste de deploy: este commit foi feito para validar o webhook do GitHub.
