@@ -141,6 +141,56 @@ function detect_task_type(string $prompt, string $repo, array $tree): array
         if (($item['type'] ?? '') === 'blob') $paths[] = mb_strtolower((string)($item['path'] ?? ''), 'UTF-8');
     }
     $hay = implode("\n", array_slice($paths, 0, 250));
+
+    $hardRefactorSignals = [
+        'refatore tudo',
+        'reorganize a estrutura',
+        'reorganizar a estrutura',
+        'projeto inteiro',
+        'projeto todo',
+        'pastas e arquivos',
+        'arquivos e pastas',
+        'limpar o projeto',
+        'refatoração grande',
+        'refatoracao grande',
+    ];
+    $hardBugSignals = [
+        'procure erros e conserte',
+        'procure erros',
+        'conserte-os',
+        'conserte os erros',
+        'corrija erros',
+        'corrigir erros',
+    ];
+    $hardRefactorHit = false;
+    foreach ($hardRefactorSignals as $signal) {
+        if (str_contains($p, $signal)) {
+            $hardRefactorHit = true;
+            break;
+        }
+    }
+    $hardBugHit = false;
+    foreach ($hardBugSignals as $signal) {
+        if (str_contains($p, $signal)) {
+            $hardBugHit = true;
+            break;
+        }
+    }
+    if ($hardRefactorHit) {
+        return [
+            'type' => $hardBugHit ? 'refactor' : 'refactor',
+            'size' => 'large',
+            'confidence' => 0.92,
+        ];
+    }
+    if ($hardBugHit && str_contains($p, 'projeto inteiro')) {
+        return [
+            'type' => 'refactor',
+            'size' => 'large',
+            'confidence' => 0.86,
+        ];
+    }
+
     $rules = [
         ['type' => 'webhook/deploy', 'size' => 'tiny', 'terms' => ['webhook', 'deploy', 'push', 'assinatura', 'github action', 'github actions', 'webhook do github'], 'paths' => ['webhook', 'deploy', '.github']],
         ['type' => 'frontend/ui', 'size' => 'small', 'terms' => ['tela', 'layout', 'ui', 'interface', 'css', 'html', 'modal', 'botão', 'botao', 'card', 'menu', 'responsivo', 'mobile'], 'paths' => ['css', 'html', 'js', 'assets', 'views', 'templates']],
@@ -327,7 +377,10 @@ function build_recommendation(array $comparisons, array $taskType, int $inputTok
     } elseif ($type === 'backend/php' || $type === 'bugfix') {
         $recommended = $confidence >= 0.62 ? 'GPT-5.3-Codex' : 'GPT-5.4-mini';
     } elseif ($type === 'database' || $type === 'automation' || $type === 'refactor') {
-        $recommended = 'GPT-5.3-Codex';
+        $recommended = $type === 'refactor' && ($confidence >= 0.8 || $inputTokens > 70000) ? 'GPT-5.5' : 'GPT-5.3-Codex';
+        if ($type === 'refactor' && $recommended === 'GPT-5.5') {
+            $risk = 'alto';
+        }
     } elseif ($type === 'diagnostic') {
         $recommended = $inputTokens > 50000 ? 'GPT-5.5' : 'GPT-5.3-Codex';
         $risk = $inputTokens > 50000 ? 'médio' : 'baixo';
