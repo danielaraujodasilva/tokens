@@ -142,21 +142,55 @@ function detect_task_type(string $prompt, string $repo, array $tree): array
     }
     $hay = implode("\n", array_slice($paths, 0, 250));
     $rules = [
-        ['type' => 'webhook/deploy', 'size' => 'tiny', 'terms' => ['webhook', 'deploy', 'push', 'assinatura'], 'paths' => ['webhook', 'deploy', '.github']],
-        ['type' => 'frontend/ui', 'size' => 'small', 'terms' => ['tela', 'layout', 'ui', 'interface', 'css', 'html', 'modal', 'botão', 'botao'], 'paths' => ['css', 'html', 'js', 'assets', 'views']],
-        ['type' => 'backend/php', 'size' => 'small', 'terms' => ['php', 'endpoint', 'api', 'handler', 'post', 'get'], 'paths' => ['.php', 'api', 'handler']],
-        ['type' => 'database', 'size' => 'medium', 'terms' => ['banco', 'sql', 'mysql', 'query', 'pdo', 'mysqli'], 'paths' => ['sql', 'db', 'database']],
-        ['type' => 'automation', 'size' => 'medium', 'terms' => ['whatsapp', 'bot', 'cron', 'worker', 'automação', 'automacao'], 'paths' => ['bot', 'whatsapp', 'cron', 'worker']],
-        ['type' => 'bugfix', 'size' => 'small', 'terms' => ['bug', 'erro', 'corrigir', 'consertar', 'quebrado', 'falha'], 'paths' => []],
-        ['type' => 'refactor', 'size' => 'large', 'terms' => ['refator', 'reorganizar', 'estruturar'], 'paths' => []],
-        ['type' => 'docs/content', 'size' => 'tiny', 'terms' => ['readme', 'document', 'docs', 'texto', 'conteúdo', 'conteudo'], 'paths' => ['readme', '.md']],
+        ['type' => 'webhook/deploy', 'size' => 'tiny', 'terms' => ['webhook', 'deploy', 'push', 'assinatura', 'github action', 'github actions', 'webhook do github'], 'paths' => ['webhook', 'deploy', '.github']],
+        ['type' => 'frontend/ui', 'size' => 'small', 'terms' => ['tela', 'layout', 'ui', 'interface', 'css', 'html', 'modal', 'botão', 'botao', 'card', 'menu', 'responsivo', 'mobile'], 'paths' => ['css', 'html', 'js', 'assets', 'views', 'templates']],
+        ['type' => 'backend/php', 'size' => 'small', 'terms' => ['php', 'endpoint', 'api', 'handler', 'post', 'get', 'include', 'require', 'sessao', 'sessão'], 'paths' => ['.php', 'api', 'handler', 'config']],
+        ['type' => 'database', 'size' => 'medium', 'terms' => ['banco', 'sql', 'mysql', 'query', 'pdo', 'mysqli', 'schema', 'migration', 'relacao', 'relação'], 'paths' => ['sql', 'db', 'database', 'migration']],
+        ['type' => 'automation', 'size' => 'medium', 'terms' => ['whatsapp', 'bot', 'cron', 'worker', 'automação', 'automacao', 'fila', 'job', 'agendamento'], 'paths' => ['bot', 'whatsapp', 'cron', 'worker', 'queue', 'job']],
+        ['type' => 'bugfix', 'size' => 'small', 'terms' => ['bug', 'erro', 'corrigir', 'consertar', 'quebrado', 'falha', 'não funciona', 'nao funciona', 'não abre', 'nao abre', 'não salva', 'nao salva', 'parou'], 'paths' => []],
+        ['type' => 'refactor', 'size' => 'large', 'terms' => ['refator', 'reorganizar', 'estruturar', 'limpar', 'simplificar', 'reduzir duplicação', 'reduzir duplicacao'], 'paths' => []],
+        ['type' => 'docs/content', 'size' => 'tiny', 'terms' => ['readme', 'document', 'docs', 'texto', 'conteúdo', 'conteudo', 'copy', 'redação', 'redacao'], 'paths' => ['readme', '.md']],
+        ['type' => 'diagnostic', 'size' => 'medium', 'terms' => ['investigue', 'descubra', 'diagnostique', 'analise', 'análise', 'por que', 'porque', 'onde está', 'onde esta'], 'paths' => []],
     ];
     foreach ($rules as $rule) {
         $score = 0;
-        foreach ($rule['terms'] as $term) { if (str_contains($p, $term) || str_contains($hay, $term)) $score++; }
-        foreach ($rule['paths'] as $term) { if (str_contains($r, $term) || str_contains($hay, $term)) $score += 2; }
-        if ($score >= 3) return ['type' => $rule['type'], 'size' => $rule['size'], 'confidence' => min(0.95, 0.5 + ($score * 0.07))];
+        foreach ($rule['terms'] as $term) {
+            if (str_contains($p, $term)) $score += 3;
+            if (str_contains($hay, $term)) $score += 1;
+        }
+        foreach ($rule['paths'] as $term) {
+            if (str_contains($r, $term)) $score += 2;
+            if (str_contains($hay, $term)) $score += 1;
+        }
+        if ($score >= 5) return ['type' => $rule['type'], 'size' => $rule['size'], 'confidence' => min(0.97, 0.42 + ($score * 0.06))];
     }
+
+    $complexity = 0;
+    foreach ([
+        'corrigir' => 2, 'ajustar' => 1, 'implementar' => 2, 'migrar' => 3, 'refator' => 3,
+        'simplificar' => 2, 'reorganizar' => 3, 'otimizar' => 2, 'investigar' => 2, 'descobrir' => 2,
+        'vários arquivos' => 3, 'varios arquivos' => 3, 'multiplos arquivos' => 3, 'múltiplos arquivos' => 3,
+        'sem refatorar' => -1, 'menor diff' => -1, 'apenas' => -1, 'só' => -1, 'so' => -1,
+    ] as $term => $weight) {
+        if (str_contains($p, $term)) $complexity += $weight;
+    }
+
+    if (preg_match_all('/[\p{L}\p{N}_-]{4,}/u', $p, $matches)) {
+        $uniqueWords = count(array_unique($matches[0] ?? []));
+        if ($uniqueWords > 22) $complexity += 2;
+        if ($uniqueWords > 35) $complexity += 2;
+    }
+
+    $hasMoreThanOneArea = 0;
+    foreach (['php', 'js', 'css', 'html', 'sql', 'api', 'webhook', 'deploy', 'whatsapp', 'bot', 'cron'] as $needle) {
+        if (str_contains($hay, $needle)) $hasMoreThanOneArea++;
+    }
+    if ($hasMoreThanOneArea >= 4) $complexity += 2;
+
+    if ($complexity >= 8) return ['type' => 'refactor', 'size' => 'large', 'confidence' => 0.68];
+    if ($complexity >= 5) return ['type' => 'backend/php', 'size' => 'medium', 'confidence' => 0.58];
+    if ($complexity >= 2) return ['type' => 'bugfix', 'size' => 'small', 'confidence' => 0.52];
+
     return ['type' => 'general', 'size' => 'medium', 'confidence' => 0.45];
 }
 
@@ -296,6 +330,17 @@ function build_hourly_note(array $recommendation, int $promptTokens, int $inputT
     return "Este prompt representa cerca de {$impact}% do contexto estimado. No cenário realista/normal, a opção mais barata ficou em {$bestCredits} créditos. Isso dá uma noção prática do impacto por hora, sem depender de login/billing.";
 }
 
+function example_prompts(): array
+{
+    return [
+        ['label' => 'Webhook simples', 'prompt' => 'Ajuste o webhook do GitHub para atualizar o servidor automaticamente sem quebrar o deploy. Quero a menor mudança possível.'],
+        ['label' => 'Bug de interface', 'prompt' => 'No tokens, reduza a complexidade da tela, deixe só prompt e URL do repositório, e corrija qualquer problema de layout no mobile.'],
+        ['label' => 'Investigação', 'prompt' => 'Investigue por que o fluxo de deploy pode falhar em alguns commits e me diga onde está a causa com o menor diff possível.'],
+        ['label' => 'Banco de dados', 'prompt' => 'Analise as queries e as tabelas relacionadas e sugira a alteração mínima para evitar duplicidade e melhorar a leitura dos dados.'],
+        ['label' => 'Refatoração grande', 'prompt' => 'Reorganize a base, simplifique os arquivos principais e remova duplicação, mas sem mudar o comportamento final.'],
+    ];
+}
+
 function build_optimized_prompt(string $prompt, array $selected, string $model): string
 {
     $paths = array_slice(array_map(fn($f) => $f['path'], $selected), 0, 10);
@@ -351,6 +396,15 @@ function build_optimized_prompt(string $prompt, array $selected, string $model):
             <div class="helpitem"><b>Por hora</b><span>Mostramos uma referência do peso do prompt no contexto estimado. Isso ajuda a ter ideia de quanto daquele orçamento vai embora numa execução.</span></div>
             <div class="helpitem"><b>Plano econômico</b><span>O comparativo já aponta qual modelo e qual velocidade gastam menos, então você decide pelo menor custo sem abrir menu demais.</span></div>
             <div class="helpitem"><b>Limite real</b><span>Se depois você quiser saldo real, aí a conversa muda para autenticação e billing. Por enquanto, a estimativa proporcional resolve bem.</span></div>
+        </div>
+        <h3 style="margin:18px 0 10px;">Prompts para testar modelos diferentes</h3>
+        <div class="helpgrid">
+            <?php foreach (example_prompts() as $item): ?>
+                <div class="helpitem">
+                    <b><?php echo htmlspecialchars($item['label'], ENT_QUOTES, 'UTF-8'); ?></b>
+                    <span><?php echo htmlspecialchars($item['prompt'], ENT_QUOTES, 'UTF-8'); ?></span>
+                </div>
+            <?php endforeach; ?>
         </div>
     </section>
 
