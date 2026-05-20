@@ -1,12 +1,4 @@
 <?php
-/**
- * Token Miser - Estimador pré-play de consumo para Codex
- * Arquivo único: coloque em uma pasta do seu servidor PHP/XAMPP e acesse pelo navegador.
- *
- * Observação honesta: isto estima. Não prevê tool calls, loops internos, cache real ou o que
- * o agente vai decidir abrir depois. Mas já evita muita queima de token por prompt aberto demais.
- */
-
 if (isset($_GET['action']) && $_GET['action'] === 'analyze') {
     header('Content-Type: application/json; charset=utf-8');
     try {
@@ -14,9 +6,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'analyze') {
         if (!$input) {
             throw new Exception('JSON inválido.');
         }
-
-        $result = analyze_repo($input);
-        echo json_encode(['ok' => true, 'result' => $result], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+        echo json_encode(['ok' => true, 'result' => analyze_repo($input)], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
     } catch (Throwable $e) {
         http_response_code(400);
         echo json_encode(['ok' => false, 'error' => $e->getMessage()], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
@@ -28,10 +18,6 @@ function analyze_repo(array $input): array
 {
     $repoUrl = trim($input['repo_url'] ?? '');
     $prompt = trim($input['prompt'] ?? '');
-    $branch = trim($input['branch'] ?? '');
-    $taskSize = $input['task_size'] ?? 'medium';
-    $maxFiles = max(3, min(60, intval($input['max_files'] ?? 18)));
-    $includeAgents = !empty($input['include_agents']);
     $githubToken = trim($input['github_token'] ?? '');
 
     if ($repoUrl === '') throw new Exception('Informe a URL do repositório GitHub.');
@@ -44,167 +30,81 @@ function analyze_repo(array $input): array
     }
 
     $repoMeta = github_get_json("https://api.github.com/repos/$owner/$repo", $headers);
-    if ($branch === '') {
-        $branch = $repoMeta['default_branch'] ?? 'main';
-    }
-
+    $branch = $repoMeta['default_branch'] ?? 'main';
     $tree = github_get_json("https://api.github.com/repos/$owner/$repo/git/trees/" . rawurlencode($branch) . "?recursive=1", $headers);
-    if (empty($tree['tree'])) throw new Exception('Não consegui ler a árvore do repositório. Verifique repo/branch/token.');
+    if (empty($tree['tree'])) throw new Exception('Não consegui ler a árvore do repositório.');
 
+    $taskType = detect_task_type($prompt, $repo, $tree['tree']);
     $allFiles = [];
     foreach ($tree['tree'] as $item) {
         if (($item['type'] ?? '') !== 'blob') continue;
-        $path = $item['path'] ?? '';
+        $path = (string)($item['path'] ?? '');
         $size = intval($item['size'] ?? 0);
         if (!is_candidate_text_file($path, $size)) continue;
-        $score = score_file($path, $prompt, $includeAgents);
-        if ($score <= 0 && !$includeAgents) continue;
-
-        $allFiles[] = [
-            'path' => $path,
-            'sha' => $item['sha'] ?? '',
-            'size' => $size,
-            'score' => $score,
-        ];
+        $score = score_file($path, $prompt, $taskType);
+        if ($score <= 0) continue;
+        $allFiles[] = ['path' => $path, 'sha' => $item['sha'] ?? '', 'size' => $size, 'score' => $score];
     }
 
-    usort($allFiles, function($a, $b) {
-        if ($b['score'] === $a['score']) return $a['size'] <=> $b['size'];
-        return $b['score'] <=> $a['score'];
-    });
-
-    $selected = array_slice($allFiles, 0, $maxFiles);
-
-    if ($includeAgents) {
-        foreach ($allFiles as $file) {
-            if (preg_match('~(^|/)AGENTS\.md$~i', $file['path'])) {
-                $exists = false;
-                foreach ($selected as $s) {
-                    if ($s['path'] === $file['path']) $exists = true;
-                }
-                if (!$exists) array_unshift($selected, $file);
-                break;
-            }
-        }
-    }
+    usort($allFiles, fn($a, $b) => $b['score'] === $a['score'] ? $a['size'] <=> $b['size'] : $b['score'] <=> $a['score']);
+    $selected = array_slice($allFiles, 0, min(8, max(4, count($allFiles))));
 
     $fileRows = [];
     $fileTokens = 0;
-    $fetchLimitBytes = 900000;
-
     foreach ($selected as $file) {
-        if ($file['size'] > $fetchLimitBytes) {
-            $estimated = approximate_tokens_from_length($file['size']);
-            $fileRows[] = [
-                'path' => $file['path'],
-                'tokens' => $estimated,
-                'size' => $file['size'],
-                'score' => $file['score'],
-                'fetched' => false,
-                'note' => 'Arquivo grande: estimado por tamanho, não baixado completo.',
-            ];
-            $fileTokens += $estimated;
-            continue;
-        }
-
-        $content = fetch_blob_text($owner, $repo, $file['sha'], $headers);
-        $tokens = estimate_tokens($content);
+        $tokens = $file['size'] > 450000
+            ? approximate_tokens_from_length($file['size'])
+            : estimate_tokens(fetch_blob_text($owner, $repo, $file['sha'], $headers));
         $fileTokens += $tokens;
         $fileRows[] = [
             'path' => $file['path'],
             'tokens' => $tokens,
             'size' => $file['size'],
             'score' => $file['score'],
-            'fetched' => true,
-            'note' => '',
         ];
     }
 
     $promptTokens = estimate_tokens($prompt);
-    $outputTokens = estimate_output_tokens($taskSize, $prompt);
     $inputTokens = $promptTokens + $fileTokens;
-
-    $rates = codex_rates();
-    $speedMultipliers = [
-        'normal' => floatval($input['speed_normal'] ?? 1.0),
-        'fast' => floatval($input['speed_fast'] ?? 1.5),
-        'turbo' => floatval($input['speed_turbo'] ?? 2.0),
-    ];
-
-    $scenarios = [
-        'direto' => 1.00,
-        'realista' => 1.30,
-        'pessimista' => 1.70,
-    ];
-
-    $comparisons = [];
-    foreach ($rates as $model => $rate) {
-        foreach ($speedMultipliers as $speed => $multiplier) {
-            foreach ($scenarios as $scenario => $scenarioMultiplier) {
-                $scenarioInput = intval(ceil($inputTokens * $scenarioMultiplier));
-                $scenarioOutput = intval(ceil($outputTokens * ($scenario === 'pessimista' ? 1.25 : ($scenario === 'realista' ? 1.10 : 1.00))));
-                $credits = estimate_credits($scenarioInput, 0, $scenarioOutput, $rate, $multiplier);
-                $comparisons[] = [
-                    'model' => $model,
-                    'speed' => $speed,
-                    'scenario' => $scenario,
-                    'input_tokens' => $scenarioInput,
-                    'output_tokens' => $scenarioOutput,
-                    'total_tokens' => $scenarioInput + $scenarioOutput,
-                    'credits' => round($credits, 4),
-                    'multiplier' => $multiplier,
-                ];
-            }
-        }
-    }
-
+    $outputTokens = estimate_output_tokens($taskType['size'], $prompt);
+    $comparisons = build_comparisons($inputTokens, $outputTokens);
     usort($comparisons, fn($a, $b) => $a['credits'] <=> $b['credits']);
 
-    $recommendation = build_recommendation($comparisons, $inputTokens, $taskSize, $selected, $prompt);
-    $optimizedPrompt = build_optimized_prompt($prompt, $selected, $recommendation['recommended_model'] ?? 'GPT-5.4-mini');
+    $recommendation = build_recommendation($comparisons, $taskType, $inputTokens, $prompt);
 
     return [
         'repo' => "$owner/$repo",
         'branch' => $branch,
+        'task_type' => $taskType,
         'prompt_tokens' => $promptTokens,
-        'file_tokens' => $fileTokens,
         'input_tokens_direct' => $inputTokens,
         'output_tokens_estimated' => $outputTokens,
         'selected_files' => $fileRows,
-        'total_candidate_files' => count($allFiles),
         'comparisons' => $comparisons,
         'recommendation' => $recommendation,
-        'optimized_prompt' => $optimizedPrompt,
-        'rates_source_note' => 'Taxas editáveis no código. Baseadas no rate card público do Codex consultado em 2026-05-20.',
-        'accuracy_note' => 'Estimativa: não inclui loops internos, comandos de terminal, arquivos abertos depois pelo agente, MCP servers, cache real ou retries.',
+        'hourly_context_note' => build_hourly_note($recommendation, $promptTokens, $inputTokens),
+        'optimized_prompt' => build_optimized_prompt($prompt, $selected, $recommendation['recommended_model'] ?? 'GPT-5.4-mini'),
+        'accuracy_note' => 'Estimativa: não inclui tool calls, loops internos, cache real, nem arquivos adicionais abertos depois.',
     ];
 }
 
 function parse_github_repo(string $url): array
 {
-    $url = trim($url);
-
-    if (preg_match('~github\.com[:/]+([^/\s]+)/([^/\s#?]+)~i', $url, $m)) {
+    if (preg_match('~github\.com[:/]+([^/\s]+)/([^/\s#?]+)~i', trim($url), $m)) {
         return [$m[1], preg_replace('~\.git$~', '', $m[2])];
     }
-
-    if (preg_match('~^([^/\s]+)/([^/\s]+)$~', $url, $m)) {
+    if (preg_match('~^([^/\s]+)/([^/\s]+)$~', trim($url), $m)) {
         return [$m[1], preg_replace('~\.git$~', '', $m[2])];
     }
-
-    throw new Exception('URL inválida. Use algo como https://github.com/usuario/repositorio ou usuario/repositorio.');
+    throw new Exception('URL inválida. Use algo como https://github.com/usuario/repositorio.');
 }
 
 function github_get_json(string $url, array $headers): array
 {
     $body = http_get($url, $headers);
     $data = json_decode($body, true);
-    if (!is_array($data)) {
-        throw new Exception('Resposta inválida da API do GitHub.');
-    }
-    if (!empty($data['message']) && isset($data['documentation_url'])) {
-        throw new Exception('GitHub API: ' . $data['message']);
-    }
+    if (!is_array($data)) throw new Exception('Resposta inválida da API do GitHub.');
+    if (!empty($data['message']) && isset($data['documentation_url'])) throw new Exception('GitHub API: ' . $data['message']);
     return $data;
 }
 
@@ -212,153 +112,96 @@ function http_get(string $url, array $headers): string
 {
     if (function_exists('curl_init')) {
         $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_TIMEOUT => 30,
-            CURLOPT_HTTPHEADER => $headers,
-        ]);
+        curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_FOLLOWLOCATION => true, CURLOPT_TIMEOUT => 30, CURLOPT_HTTPHEADER => $headers]);
         $body = curl_exec($ch);
         $err = curl_error($ch);
         $code = intval(curl_getinfo($ch, CURLINFO_HTTP_CODE));
         curl_close($ch);
-
-        if ($body === false || $code >= 400) {
-            throw new Exception("Erro ao acessar GitHub ($code): " . ($err ?: substr((string)$body, 0, 300)));
-        }
+        if ($body === false || $code >= 400) throw new Exception("Erro ao acessar GitHub ($code): " . ($err ?: substr((string)$body, 0, 250)));
         return $body;
     }
-
-    $context = stream_context_create([
-        'http' => [
-            'method' => 'GET',
-            'header' => implode("\r\n", $headers),
-            'timeout' => 30,
-        ]
-    ]);
+    $context = stream_context_create(['http' => ['method' => 'GET', 'header' => implode("\r\n", $headers), 'timeout' => 30]]);
     $body = @file_get_contents($url, false, $context);
-    if ($body === false) throw new Exception('Erro ao acessar GitHub. Ative cURL no PHP para melhores resultados.');
+    if ($body === false) throw new Exception('Erro ao acessar GitHub.');
     return $body;
 }
 
 function fetch_blob_text(string $owner, string $repo, string $sha, array $headers): string
 {
     $blob = github_get_json("https://api.github.com/repos/$owner/$repo/git/blobs/$sha", $headers);
-    $encoding = $blob['encoding'] ?? '';
-    $content = $blob['content'] ?? '';
+    return (($blob['encoding'] ?? '') === 'base64') ? (base64_decode((string)($blob['content'] ?? '')) ?: '') : (string)($blob['content'] ?? '');
+}
 
-    if ($encoding === 'base64') {
-        return base64_decode($content) ?: '';
+function detect_task_type(string $prompt, string $repo, array $tree): array
+{
+    $p = mb_strtolower($prompt, 'UTF-8');
+    $r = mb_strtolower($repo, 'UTF-8');
+    $paths = [];
+    foreach ($tree as $item) {
+        if (($item['type'] ?? '') === 'blob') $paths[] = mb_strtolower((string)($item['path'] ?? ''), 'UTF-8');
     }
-
-    return (string)$content;
+    $hay = implode("\n", array_slice($paths, 0, 250));
+    $rules = [
+        ['type' => 'webhook/deploy', 'size' => 'tiny', 'terms' => ['webhook', 'deploy', 'push', 'assinatura'], 'paths' => ['webhook', 'deploy', '.github']],
+        ['type' => 'frontend/ui', 'size' => 'small', 'terms' => ['tela', 'layout', 'ui', 'interface', 'css', 'html', 'modal', 'botão', 'botao'], 'paths' => ['css', 'html', 'js', 'assets', 'views']],
+        ['type' => 'backend/php', 'size' => 'small', 'terms' => ['php', 'endpoint', 'api', 'handler', 'post', 'get'], 'paths' => ['.php', 'api', 'handler']],
+        ['type' => 'database', 'size' => 'medium', 'terms' => ['banco', 'sql', 'mysql', 'query', 'pdo', 'mysqli'], 'paths' => ['sql', 'db', 'database']],
+        ['type' => 'automation', 'size' => 'medium', 'terms' => ['whatsapp', 'bot', 'cron', 'worker', 'automação', 'automacao'], 'paths' => ['bot', 'whatsapp', 'cron', 'worker']],
+        ['type' => 'bugfix', 'size' => 'small', 'terms' => ['bug', 'erro', 'corrigir', 'consertar', 'quebrado', 'falha'], 'paths' => []],
+        ['type' => 'refactor', 'size' => 'large', 'terms' => ['refator', 'reorganizar', 'estruturar'], 'paths' => []],
+        ['type' => 'docs/content', 'size' => 'tiny', 'terms' => ['readme', 'document', 'docs', 'texto', 'conteúdo', 'conteudo'], 'paths' => ['readme', '.md']],
+    ];
+    foreach ($rules as $rule) {
+        $score = 0;
+        foreach ($rule['terms'] as $term) { if (str_contains($p, $term) || str_contains($hay, $term)) $score++; }
+        foreach ($rule['paths'] as $term) { if (str_contains($r, $term) || str_contains($hay, $term)) $score += 2; }
+        if ($score >= 3) return ['type' => $rule['type'], 'size' => $rule['size'], 'confidence' => min(0.95, 0.5 + ($score * 0.07))];
+    }
+    return ['type' => 'general', 'size' => 'medium', 'confidence' => 0.45];
 }
 
 function is_candidate_text_file(string $path, int $size): bool
 {
     $lower = strtolower($path);
-
-    $ignoreDirs = [
-        '.git/', 'node_modules/', 'vendor/', 'dist/', 'build/', '.next/', 'storage/',
-        'logs/', 'cache/', 'tmp/', 'uploads/', 'backup/', 'backups/', '__pycache__/',
-    ];
-    foreach ($ignoreDirs as $dir) {
+    foreach (['.git/', 'node_modules/', 'vendor/', 'dist/', 'build/', 'storage/', 'logs/', 'cache/', 'tmp/'] as $dir) {
         if (str_contains($lower, $dir)) return false;
     }
-
-    $ignoreNames = [
-        'package-lock.json', 'composer.lock', 'yarn.lock', 'pnpm-lock.yaml',
-    ];
-    if (in_array(basename($lower), $ignoreNames, true)) return false;
-
-    $binaryExt = [
-        'png','jpg','jpeg','gif','webp','ico','pdf','zip','rar','7z','gz','tar',
-        'mp4','mov','avi','mp3','wav','ttf','otf','woff','woff2','exe','dll','bin',
-        'sqlite','db','psd','ai','sketch'
-    ];
     $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
-    if (in_array($ext, $binaryExt, true)) return false;
-
-    $textExt = [
-        'php','js','ts','tsx','jsx','css','scss','html','htm','json','md','txt','sql',
-        'py','yml','yaml','xml','env','example','ini','conf','sh','bat','ps1','lock',
-        'vue','svelte','cjs','mjs','htaccess'
-    ];
-
-    if (preg_match('~(^|/)AGENTS\.md$~i', $path)) return true;
-    if (preg_match('~(^|/)\.env\.example$~i', $path)) return true;
-    if ($size <= 0) return false;
-    if ($size > 1500000) return false;
-
-    return in_array($ext, $textExt, true) || basename($path) === '.htaccess';
+    if ($size <= 0 || $size > 1500000) return false;
+    if (in_array($ext, ['png','jpg','jpeg','gif','webp','ico','pdf','zip','rar','7z','gz','tar','mp4','mov','avi','mp3','wav','ttf','otf','woff','woff2','exe','dll','bin','sqlite','db'], true)) return false;
+    return in_array($ext, ['php','js','ts','tsx','jsx','css','scss','html','htm','json','md','txt','sql','py','yml','yaml','xml','env','ini','conf','sh','bat','ps1','vue','svelte','cjs','mjs','lock'], true) || basename($path) === '.htaccess';
 }
 
-function score_file(string $path, string $prompt, bool $includeAgents): int
+function score_file(string $path, string $prompt, array $taskType): int
 {
     $p = mb_strtolower($prompt, 'UTF-8');
     $pathLower = mb_strtolower($path, 'UTF-8');
-    $base = mb_strtolower(basename($path), 'UTF-8');
     $score = 0;
-
-    if ($includeAgents && preg_match('~(^|/)agents\.md$~i', $pathLower)) $score += 1000;
-
-    $keywords = extract_keywords($p);
-    foreach ($keywords as $kw) {
-        if (mb_strlen($kw, 'UTF-8') < 3) continue;
-        if (str_contains($pathLower, $kw)) $score += 12;
-        if (str_contains($base, $kw)) $score += 18;
+    foreach (extract_keywords($p) as $kw) {
+        if (mb_strlen($kw, 'UTF-8') >= 3 && (str_contains($pathLower, $kw) || str_contains(basename($pathLower), $kw))) $score += 10;
     }
-
     $maps = [
-        'crm' => ['crm/', 'lead', 'pipeline', 'kanban', 'handler', 'configuracoes', 'index.php'],
-        'lead' => ['crm/', 'lead', 'handler', 'pipeline', 'index.php'],
-        'modal' => ['modal', 'index.php', '.js', 'bootstrap'],
-        'botao' => ['button', 'btn', 'index.php', '.js', '.css'],
-        'formulario' => ['form', 'handler', 'submit', 'index.php'],
-        'whatsapp' => ['whatsapp', 'baileys', 'venom', 'bot', 'zap'],
-        'baileys' => ['baileys', 'whatsapp', 'bot', 'session'],
-        'webhook' => ['webhook', 'deploy', 'github', 'handler'],
-        'login' => ['login', 'auth', 'senha', 'usuario', 'user'],
-        'css' => ['.css', 'style', 'tailwind', 'bootstrap'],
-        'javascript' => ['.js', 'script', 'assets/js'],
-        'php' => ['.php'],
-        'banco' => ['sql', 'db', 'database', 'mysql', 'pdo', 'mysqli'],
-        'mysql' => ['sql', 'db', 'database', 'mysql', 'pdo', 'mysqli'],
-        'ficha' => ['ficha/'],
-        'orcamento' => ['orcamento/', 'budget', 'quote'],
-        'zap' => ['zap/', 'analisador', 'whatsapp'],
+        'webhook/deploy' => ['webhook', 'deploy', 'github', 'handler'],
+        'frontend/ui' => ['index.php', '.css', '.js', 'modal', 'button', 'style'],
+        'backend/php' => ['.php', 'api', 'handler', 'controller'],
+        'database' => ['sql', 'db', 'database', 'mysql', 'pdo', 'mysqli'],
+        'automation' => ['whatsapp', 'bot', 'cron', 'worker'],
+        'bugfix' => ['index.php', '.php', '.js', '.css', 'handler'],
+        'refactor' => ['index.php', '.php', '.js', '.css'],
+        'docs/content' => ['readme', '.md', 'docs'],
+        'general' => ['index.php', '.php', '.js', '.css'],
     ];
-
-    foreach ($maps as $trigger => $needles) {
-        if (str_contains($p, $trigger)) {
-            foreach ($needles as $needle) {
-                if (str_contains($pathLower, $needle)) $score += 20;
-            }
-        }
-    }
-
-    foreach (['index.php','handler.php','config.php','configuracoes.php','app.js','main.js','style.css','package.json'] as $central) {
-        if ($base === $central) $score += 8;
-    }
-
-    if (str_contains($pathLower, 'readme')) $score -= 6;
-    if (str_contains($pathLower, 'mock') || str_contains($pathLower, 'sample')) $score -= 4;
-
+    $task = (string)($taskType['type'] ?? 'general');
+    foreach (($maps[$task] ?? []) as $needle) if (str_contains($pathLower, $needle)) $score += 20;
     return max(0, $score);
 }
 
 function extract_keywords(string $prompt): array
 {
     preg_match_all('/[\p{L}\p{N}_-]{3,}/u', $prompt, $matches);
-    $words = $matches[0] ?? [];
-    $stop = array_flip([
-        'para','com','que','uma','por','dos','das','nos','nas','esse','essa','isso','aquele',
-        'aquela','corrija','crie','faça','faca','alterar','altere','ajuste','usar','use',
-        'somente','arquivo','arquivos','projeto','repositorio','repositório','preciso','quero',
-        'codex','token','tokens','github','branch','main','master','the','and','for','with'
-    ]);
+    $stop = array_flip(['para','com','que','uma','por','dos','das','nos','nas','esse','essa','isso','aquele','aquela','corrija','crie','faça','faca','alterar','altere','ajuste','usar','use','somente','arquivo','arquivos','projeto','repositorio','repositório','preciso','quero','codex','token','tokens','github','branch','main','master','the','and','for','with']);
     $out = [];
-    foreach ($words as $w) {
+    foreach ($matches[0] ?? [] as $w) {
         $w = mb_strtolower($w, 'UTF-8');
         if (!isset($stop[$w])) $out[$w] = true;
     }
@@ -369,43 +212,46 @@ function estimate_tokens(string $text): int
 {
     $len = strlen($text);
     if ($len === 0) return 0;
-
     preg_match_all('/[^\s]/u', $text, $nonSpace);
-    $nonSpaceCount = count($nonSpace[0] ?? []);
-    $byChars = $len / 3.6;
-    $byNonSpace = $nonSpaceCount / 2.9;
-
-    return (int)ceil(max($byChars, $byNonSpace));
+    return (int)ceil(max($len / 3.6, count($nonSpace[0] ?? []) / 2.9));
 }
 
-function approximate_tokens_from_length(int $bytes): int
-{
-    return (int)ceil($bytes / 3.6);
-}
+function approximate_tokens_from_length(int $bytes): int { return (int)ceil($bytes / 3.6); }
 
 function estimate_output_tokens(string $taskSize, string $prompt): int
 {
-    $map = [
-        'tiny' => 1200,
-        'small' => 2200,
-        'medium' => 4200,
-        'large' => 7600,
-        'diagnostic' => 3000,
-        'review' => 5200,
-    ];
-
+    $map = ['tiny' => 1200, 'small' => 2200, 'medium' => 4200, 'large' => 7600];
     $base = $map[$taskSize] ?? 4200;
     $p = mb_strtolower($prompt, 'UTF-8');
-
-    if (str_contains($p, 'explique') || str_contains($p, 'detalhado') || str_contains($p, 'documente')) {
-        $base = (int)ceil($base * 1.35);
-    }
-
-    if (str_contains($p, 'resumo curto') || str_contains($p, 'sem explicação') || str_contains($p, 'sem explicacao')) {
-        $base = (int)ceil($base * 0.65);
-    }
-
+    if (str_contains($p, 'detalh') || str_contains($p, 'document')) $base = (int)ceil($base * 1.25);
+    if (str_contains($p, 'resumo curto') || str_contains($p, 'sem explic')) $base = (int)ceil($base * 0.7);
     return $base;
+}
+
+function build_comparisons(int $inputTokens, int $outputTokens): array
+{
+    $rates = codex_rates();
+    $speeds = ['normal' => 1.0, 'fast' => 1.5, 'turbo' => 2.0];
+    $scenarios = ['direto' => 1.0, 'realista' => 1.2, 'pessimista' => 1.5];
+    $rows = [];
+    foreach ($rates as $model => $rate) {
+        foreach ($speeds as $speed => $multiplier) {
+            foreach ($scenarios as $scenario => $scenarioMultiplier) {
+                $scenarioInput = (int)ceil($inputTokens * $scenarioMultiplier);
+                $scenarioOutput = (int)ceil($outputTokens * ($scenario === 'pessimista' ? 1.2 : ($scenario === 'realista' ? 1.08 : 1.0)));
+                $rows[] = [
+                    'model' => $model,
+                    'speed' => $speed,
+                    'scenario' => $scenario,
+                    'input_tokens' => $scenarioInput,
+                    'output_tokens' => $scenarioOutput,
+                    'total_tokens' => $scenarioInput + $scenarioOutput,
+                    'credits' => round(estimate_credits($scenarioInput, 0, $scenarioOutput, $rate, $multiplier), 4),
+                ];
+            }
+        }
+    }
+    return $rows;
 }
 
 function codex_rates(): array
@@ -413,69 +259,47 @@ function codex_rates(): array
     return [
         'GPT-5.4-mini' => ['input' => 18.75, 'cached' => 1.875, 'output' => 113],
         'GPT-5.3-Codex' => ['input' => 43.75, 'cached' => 4.375, 'output' => 350],
-        'GPT-5.4' => ['input' => 62.50, 'cached' => 6.250, 'output' => 375],
-        'GPT-5.5' => ['input' => 125.00, 'cached' => 12.50, 'output' => 750],
+        'GPT-5.4' => ['input' => 62.50, 'cached' => 6.25, 'output' => 375],
+        'GPT-5.5' => ['input' => 125.0, 'cached' => 12.5, 'output' => 750],
     ];
 }
 
 function estimate_credits(int $inputTokens, int $cachedTokens, int $outputTokens, array $rate, float $speedMultiplier): float
 {
-    $credits =
-        ($inputTokens / 1000000) * $rate['input'] +
-        ($cachedTokens / 1000000) * $rate['cached'] +
-        ($outputTokens / 1000000) * $rate['output'];
-
-    return $credits * max(0.1, $speedMultiplier);
+    return ((($inputTokens / 1000000) * $rate['input']) + (($cachedTokens / 1000000) * $rate['cached']) + (($outputTokens / 1000000) * $rate['output'])) * max(0.1, $speedMultiplier);
 }
 
-function build_recommendation(array $comparisons, int $inputTokens, string $taskSize, array $selected, string $prompt): array
+function build_recommendation(array $comparisons, array $taskType, int $inputTokens, string $prompt): array
 {
-    $directNormal = array_values(array_filter($comparisons, fn($c) => $c['scenario'] === 'realista' && $c['speed'] === 'normal'));
-    usort($directNormal, fn($a, $b) => $a['credits'] <=> $b['credits']);
-
+    $normal = array_values(array_filter($comparisons, fn($c) => $c['scenario'] === 'realista' && $c['speed'] === 'normal'));
+    usort($normal, fn($a, $b) => $a['credits'] <=> $b['credits']);
+    $best = $normal[0] ?? null;
+    $risk = $taskType['size'] === 'large' || $inputTokens > 120000 ? 'médio' : 'baixo';
     $recommended = 'GPT-5.4-mini';
-    $reason = 'Contexto pequeno/médio. Use o mini e mantenha escopo fechado.';
-    $risk = 'baixo';
-
-    if ($inputTokens > 120000 || in_array($taskSize, ['large', 'review'], true)) {
-        $recommended = 'GPT-5.3-Codex';
-        $reason = 'Contexto maior ou tarefa entre vários arquivos. Melhor usar Codex dedicado e evitar GPT-5.5 salvo diagnóstico.';
-        $risk = 'médio';
-    }
-
-    if ($inputTokens > 260000) {
-        $recommended = 'GPT-5.3-Codex';
-        $reason = 'Contexto grande. Quebre a tarefa antes de rodar, mesmo com GPT-5.3-Codex.';
-        $risk = 'alto';
-    }
-
-    $p = mb_strtolower($prompt, 'UTF-8');
-    if (str_contains($p, 'não sei') || str_contains($p, 'nao sei') || str_contains($p, 'descubra') || str_contains($p, 'investigue')) {
-        $recommended = 'GPT-5.5 para diagnóstico, depois GPT-5.4-mini para aplicar';
-        $reason = 'Prompt investigativo. Use modelo forte só para diagnosticar, sem alterar arquivos, e depois aplique com modelo barato.';
-        $risk = $inputTokens > 120000 ? 'alto' : 'médio';
-    }
-
-    $best = $directNormal[0] ?? null;
-
+    if (($taskType['type'] ?? '') === 'webhook/deploy') $recommended = 'GPT-5.4-mini';
+    elseif (($taskType['type'] ?? '') === 'database' || ($taskType['type'] ?? '') === 'automation') $recommended = 'GPT-5.3-Codex';
+    elseif ($inputTokens > 180000) { $recommended = 'GPT-5.3-Codex'; $risk = 'alto'; }
     return [
         'recommended_model' => $recommended,
         'risk' => $risk,
-        'reason' => $reason,
+        'reason' => 'Tipo detectado: ' . ($taskType['type'] ?? 'general') . '. O comparativo abaixo já mostra o menor custo estimado.',
         'best_cheapest_realistic_normal' => $best,
-        'selected_file_count' => count($selected),
+        'selected_file_count' => count($comparisons),
     ];
+}
+
+function build_hourly_note(array $recommendation, int $promptTokens, int $inputTokens): string
+{
+    $best = $recommendation['best_cheapest_realistic_normal'] ?? null;
+    $bestCredits = is_array($best) ? (float)($best['credits'] ?? 0) : 0.0;
+    $impact = $inputTokens > 0 ? round(($promptTokens / max(1, $inputTokens)) * 100, 1) : 0.0;
+    return "Este prompt representa cerca de {$impact}% do contexto estimado. No cenário realista/normal, a opção mais barata ficou em {$bestCredits} créditos. Isso dá uma noção prática do impacto por hora, sem depender de login/billing.";
 }
 
 function build_optimized_prompt(string $prompt, array $selected, string $model): string
 {
-    $paths = array_slice(array_map(fn($f) => $f['path'], $selected), 0, 18);
-    $list = '';
-    foreach ($paths as $p) {
-        $list .= "- $p\n";
-    }
-
-    return trim("Use {$model}.\n\nTarefa:\n{$prompt}\n\nEscopo sugerido:\nLeia somente estes arquivos primeiro:\n{$list}\nRegras:\n- Use o AGENTS.md se existir.\n- Não leia o projeto inteiro.\n- Não refatore sem pedido explícito.\n- Faça o menor diff possível.\n- Não altere arquivos fora do escopo sem justificar antes.\n- Ao final, responda apenas com: arquivos alterados, resumo curto e como testar.");
+    $paths = array_slice(array_map(fn($f) => $f['path'], $selected), 0, 10);
+    return trim("Use {$model}.\n\nTarefa:\n{$prompt}\n\nLeia primeiro:\n- " . implode("\n- ", $paths) . "\n\nRegras:\n- Use o AGENTS.md se existir.\n- Faça o menor diff possível.\n- Não refatore sem pedido explícito.\n- No final, responda com arquivos alterados, resumo curto e como testar.");
 }
 ?>
 <!doctype html>
@@ -485,95 +309,145 @@ function build_optimized_prompt(string $prompt, array $selected, string $model):
     <title>Token Miser - Estimador pré-play do Codex</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        :root{--bg:#09090d;--panel:#11111a;--panel2:#171724;--muted:#9ba0ad;--text:#f5f7fb;--line:rgba(255,255,255,.10);--red:#ff3b5f;--red2:#b91434;--green:#36d399;--yellow:#fbbf24;--blue:#60a5fa;--purple:#a78bfa;--shadow:0 24px 70px rgba(0,0,0,.45);--radius:22px}
-        *{box-sizing:border-box}
-        body{margin:0;min-height:100vh;background:radial-gradient(circle at 16% -10%, rgba(255,59,95,.26), transparent 35%),radial-gradient(circle at 90% 10%, rgba(96,165,250,.18), transparent 30%),linear-gradient(135deg,#07070a,#11111a 45%,#09090d);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-        a{color:var(--blue)}.wrap{max-width:1260px;margin:0 auto;padding:32px 18px 70px}.hero{display:grid;grid-template-columns:1.15fr .85fr;gap:22px;align-items:stretch;margin-bottom:22px}.card{background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.025));border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);backdrop-filter:blur(10px)}.hero-main{padding:34px}.eyebrow{display:inline-flex;align-items:center;gap:8px;color:#ffd3dc;border:1px solid rgba(255,59,95,.35);background:rgba(255,59,95,.10);border-radius:999px;padding:7px 12px;font-size:13px;font-weight:700;letter-spacing:.2px}h1{font-size:clamp(32px,4vw,56px);line-height:1.02;margin:18px 0 14px}.lead{color:#c8ccd8;font-size:18px;line-height:1.55;margin:0;max-width:770px}.hero-side{padding:24px;display:flex;flex-direction:column;justify-content:space-between;gap:14px}.mini-stat{background:rgba(0,0,0,.22);border:1px solid var(--line);border-radius:18px;padding:16px}.mini-stat b{display:block;font-size:26px;margin-bottom:4px}.mini-stat span{color:var(--muted);font-size:13px}.grid{display:grid;grid-template-columns:450px 1fr;gap:22px;align-items:start}.form{padding:22px;position:sticky;top:16px}label{display:block;font-weight:800;font-size:13px;margin:16px 0 8px;color:#e8eaf1}input,textarea,select{width:100%;border:1px solid var(--line);background:#0b0b12;color:var(--text);border-radius:16px;padding:13px 14px;outline:none;font:inherit;transition:.18s border,.18s transform,.18s box-shadow}input:focus,textarea:focus,select:focus{border-color:rgba(255,59,95,.75);box-shadow:0 0 0 4px rgba(255,59,95,.12)}textarea{min-height:210px;resize:vertical;line-height:1.45}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.triple{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}.check{display:flex;align-items:center;gap:10px;margin-top:14px;color:#dce0ea;font-size:14px}.check input{width:auto}.hint{color:var(--muted);font-size:12px;line-height:1.4;margin-top:7px}.btn{border:0;cursor:pointer;width:100%;margin-top:20px;border-radius:18px;padding:15px 18px;color:white;font-weight:900;letter-spacing:.2px;background:linear-gradient(135deg,var(--red),#7c3aed);box-shadow:0 14px 35px rgba(255,59,95,.22);transition:.18s transform,.18s opacity}.btn:hover{transform:translateY(-1px)}.btn:disabled{opacity:.6;cursor:not-allowed;transform:none}.results{display:flex;flex-direction:column;gap:18px}.empty{padding:34px;text-align:center;color:var(--muted)}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.metric{padding:18px;border-radius:18px;background:rgba(0,0,0,.25);border:1px solid var(--line)}.metric small{display:block;color:var(--muted);font-size:12px}.metric b{font-size:24px;display:block;margin-top:6px}.panel{padding:22px}.panel h2{margin:0 0 14px;font-size:22px}.badge{display:inline-flex;border-radius:999px;padding:7px 11px;font-size:12px;font-weight:900;border:1px solid var(--line);background:rgba(255,255,255,.06)}.badge.green{color:#b9f8dc;background:rgba(54,211,153,.12);border-color:rgba(54,211,153,.25)}.badge.yellow{color:#fff1b8;background:rgba(251,191,36,.11);border-color:rgba(251,191,36,.25)}.badge.red{color:#ffd0d8;background:rgba(255,59,95,.12);border-color:rgba(255,59,95,.25)}.recommend{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center;padding:20px;border-radius:20px;background:radial-gradient(circle at 10% 10%,rgba(54,211,153,.16),transparent 28%),rgba(0,0,0,.28);border:1px solid var(--line)}.recommend h3{margin:0 0 5px}.recommend p{margin:0;color:#cbd0dc;line-height:1.45}table{width:100%;border-collapse:collapse;overflow:hidden}th,td{padding:12px 10px;border-bottom:1px solid var(--line);text-align:left;font-size:14px}th{color:#dce0ea;font-size:12px;text-transform:uppercase;letter-spacing:.06em;background:rgba(255,255,255,.04)}td{color:#eef1f7}tr:hover td{background:rgba(255,255,255,.025)}.scroll{overflow:auto;border:1px solid var(--line);border-radius:18px}.right{text-align:right}.muted{color:var(--muted)}.bar{height:9px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden;min-width:110px}.bar i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--green),var(--yellow),var(--red))}.copybox{width:100%;min-height:220px;white-space:pre-wrap;background:#07070b;border:1px solid var(--line);border-radius:18px;padding:16px;color:#e8eaf1;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:1.5}.copybtn{display:inline-flex;border:1px solid var(--line);background:rgba(255,255,255,.08);color:white;border-radius:999px;padding:8px 12px;cursor:pointer;font-weight:800;margin-bottom:10px}.error{padding:16px;border-radius:18px;background:rgba(255,59,95,.12);border:1px solid rgba(255,59,95,.30);color:#ffd7de}.footer-note{color:var(--muted);font-size:12px;line-height:1.45;margin-top:16px}@media(max-width:980px){.hero,.grid{grid-template-columns:1fr}.form{position:static}.summary{grid-template-columns:1fr 1fr}}@media(max-width:560px){.row,.triple,.summary{grid-template-columns:1fr}.hero-main{padding:24px}}
+        :root{--bg:#09090d;--panel:#11111a;--muted:#9ba0ad;--text:#f5f7fb;--line:rgba(255,255,255,.10);--red:#ff3b5f;--green:#36d399;--yellow:#fbbf24;--blue:#60a5fa;--shadow:0 24px 70px rgba(0,0,0,.45);--radius:18px}
+        *{box-sizing:border-box} body{margin:0;min-height:100vh;background:linear-gradient(135deg,#07070a,#11111a 45%,#09090d);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,sans-serif}
+        .wrap{max-width:1180px;margin:0 auto;padding:28px 18px 64px}.hero{display:grid;grid-template-columns:1.2fr .8fr;gap:18px;margin-bottom:18px}.card{background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.025));border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}.hero-main{padding:30px}.eyebrow{display:inline-flex;padding:7px 12px;border-radius:999px;border:1px solid rgba(255,59,95,.35);background:rgba(255,59,95,.12);color:#ffd3dc;font-size:13px;font-weight:700}.hero h1{font-size:clamp(32px,4vw,54px);line-height:1.02;margin:16px 0 12px}.lead{color:#c8ccd8;font-size:18px;line-height:1.5;margin:0}.hero-side{padding:18px;display:flex;flex-direction:column;gap:12px}.mini-stat{padding:16px;border:1px solid var(--line);border-radius:16px;background:rgba(0,0,0,.22)}.mini-stat b{display:block;font-size:24px;margin-bottom:4px}.mini-stat span{color:var(--muted);font-size:13px}.form{padding:20px;display:grid;gap:14px}.row{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:end}label{display:block;font-weight:800;font-size:13px;margin:0 0 8px}input,textarea{width:100%;border:1px solid var(--line);background:#0b0b12;color:var(--text);border-radius:14px;padding:13px 14px;font:inherit}.textarea{min-height:160px;resize:vertical}.actions{display:flex;gap:10px;flex-wrap:wrap}.btn,.help-toggle{border:0;border-radius:16px;padding:13px 16px;font-weight:900;cursor:pointer}.btn{background:linear-gradient(135deg,var(--red),#7c3aed);color:#fff;box-shadow:0 14px 35px rgba(255,59,95,.22)}.help-toggle{background:rgba(255,255,255,.06);color:var(--text);border:1px solid var(--line)}.results{display:flex;flex-direction:column;gap:16px;margin-top:18px}.panel{padding:20px}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.metric{padding:16px;border:1px solid var(--line);border-radius:16px;background:rgba(0,0,0,.24)}.metric small{display:block;color:var(--muted);font-size:12px}.metric b{display:block;font-size:22px;margin-top:6px}.badge{display:inline-flex;padding:7px 10px;border-radius:999px;border:1px solid var(--line);font-size:12px;font-weight:900}.badge.green{color:#b9f8dc;background:rgba(54,211,153,.12)}.badge.yellow{color:#fff1b8;background:rgba(251,191,36,.12)}.badge.red{color:#ffd0d8;background:rgba(255,59,95,.12)}.recommend{display:flex;justify-content:space-between;gap:12px;align-items:start;padding:18px;border-radius:18px;border:1px solid var(--line);background:rgba(0,0,0,.24)}.scroll{overflow:auto;border:1px solid var(--line);border-radius:16px}.bar{height:9px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden;min-width:110px}.bar i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--green),var(--yellow),var(--red))}table{width:100%;border-collapse:collapse}th,td{padding:12px 10px;border-bottom:1px solid var(--line);text-align:left;font-size:14px}th{color:#dce0ea;font-size:12px;text-transform:uppercase;letter-spacing:.06em;background:rgba(255,255,255,.04)}.muted{color:var(--muted)}.helpbox{display:none;padding:18px}.helpbox.open{display:block}.helpgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.helpitem{padding:16px;border:1px solid var(--line);border-radius:16px;background:rgba(0,0,0,.22)}.helpitem b{display:block;margin-bottom:6px}.helpitem span{color:var(--muted);font-size:13px;line-height:1.45}.empty{padding:30px;text-align:center;color:var(--muted)}.footer-note{color:var(--muted);font-size:12px;line-height:1.45;margin-top:12px}@media(max-width:900px){.hero,.summary,.helpgrid{grid-template-columns:1fr}.row{grid-template-columns:1fr}.lead{font-size:16px}}
     </style>
 </head>
 <body>
 <div class="wrap">
     <section class="hero">
         <div class="card hero-main">
-            <div class="eyebrow">🧮 Token Miser · pré-play do Codex</div>
-            <h1>Descubra se vale dar play antes do Codex comer seu limite.</h1>
-            <p class="lead">Cole o prompt, informe o repositório do GitHub e receba uma estimativa comparando modelos, velocidades, arquivos prováveis e risco de consumo. Não é bola de cristal, mas já é melhor que clicar em “run” e assistir seus tokens virarem fumaça com crachá.</p>
+            <div class="eyebrow">Token Miser</div>
+            <h1>Descubra o modelo mais barato antes de dar play.</h1>
+            <p class="lead">Cole o prompt e a URL do repositório. O app identifica o tipo de tarefa sozinho, estima o impacto e mostra o modelo e a velocidade mais econômicos com uma tabela comparativa logo abaixo.</p>
         </div>
         <div class="card hero-side">
-            <div class="mini-stat"><b>4 modelos</b><span>GPT-5.4-mini, GPT-5.3-Codex, GPT-5.4 e GPT-5.5</span></div>
-            <div class="mini-stat"><b>3 cenários</b><span>direto, realista e pessimista</span></div>
-            <div class="mini-stat"><b>1 prompt melhorado</b><span>com escopo sugerido para copiar no Codex</span></div>
+            <div class="mini-stat"><b>Automático</b><span>tipo de tarefa detectado pelo prompt e pelo repositório</span></div>
+            <div class="mini-stat"><b>Comparativo curto</b><span>modelo mais barato primeiro, tabela logo em seguida</span></div>
+            <div class="mini-stat"><b>Ajuda simples</b><span>botão com noção de impacto por hora, sem login</span></div>
         </div>
     </section>
-    <main class="grid">
-        <section class="card form">
-            <label for="repo">Repositório GitHub</label><input id="repo" placeholder="https://github.com/danielaraujodasilva/tatuagem" value="">
-            <div class="row"><div><label for="branch">Branch</label><input id="branch" placeholder="vazio = branch padrão"></div><div><label for="taskSize">Tipo de tarefa</label><select id="taskSize"><option value="tiny">Micro ajuste</option><option value="small">Pequena</option><option value="medium" selected>Média</option><option value="large">Grande</option><option value="diagnostic">Diagnóstico</option><option value="review">Review / PR</option></select></div></div>
-            <label for="prompt">Prompt que você pretende mandar</label><textarea id="prompt" placeholder="Ex: No CRM, corrija o modal de Novo Lead que não abre. Use o AGENTS.md. Não refatore."></textarea>
-            <div class="row"><div><label for="maxFiles">Máximo de arquivos analisados</label><input id="maxFiles" type="number" min="3" max="60" value="18"><div class="hint">Mais arquivos = estimativa mais conservadora, mas mais lenta.</div></div><div><label for="githubToken">GitHub token opcional</label><input id="githubToken" type="password" placeholder="só se repo privado ou rate limit"><div class="hint">Não salva nada. Vai só nesta requisição.</div></div></div>
-            <label>Multiplicadores de velocidade</label><div class="triple"><input id="speedNormal" type="number" step="0.1" value="1.0" title="Normal"><input id="speedFast" type="number" step="0.1" value="1.5" title="Fast"><input id="speedTurbo" type="number" step="0.1" value="2.0" title="Turbo"></div>
-            <div class="hint">Como a taxa exata de Speed/Fast pode mudar, deixei editável. Normal = 1x. Fast/Turbo são multiplicadores práticos.</div>
-            <label class="check"><input id="includeAgents" type="checkbox" checked>Incluir AGENTS.md quando existir</label>
-            <button class="btn" id="analyzeBtn">Analisar antes de dar play</button>
-            <div class="footer-note">Estima tokens por heurística local em PHP. Para máxima precisão, no futuro dá para trocar o contador por tiktoken via Python/Node no servidor.</div>
-        </section>
-        <section class="results" id="results"><div class="card empty">Preencha o prompt e o repo. A análise aparece aqui, sem drama, sem fogo no limite, sem Codex saindo para “entender o projeto” como quem vai comprar cigarro e volta com uma refatoração.</div></section>
-    </main>
+
+    <section class="card form">
+        <div>
+            <label for="repo">Repositório GitHub</label>
+            <input id="repo" placeholder="https://github.com/danielaraujodasilva/tokens">
+        </div>
+        <div>
+            <label for="prompt">Prompt</label>
+            <textarea id="prompt" class="textarea" placeholder="Ex: corrige o webhook do deploy e deixa tudo mais simples."></textarea>
+        </div>
+        <div class="actions">
+            <button class="btn" id="analyzeBtn">Analisar custo mínimo</button>
+            <button class="help-toggle" id="helpBtn" type="button">Como ler os créditos</button>
+        </div>
+    </section>
+
+    <section class="card helpbox" id="helpBox">
+        <h2 style="margin:0 0 8px;">Informativo rápido</h2>
+        <p class="footer-note" style="margin-top:0;">Não vale a pena tentar puxar saldo real da conta aqui porque isso exigiria autenticação e integração com billing. Para manter simples, o app usa uma leitura proporcional do prompt em relação ao contexto total estimado.</p>
+        <div class="helpgrid">
+            <div class="helpitem"><b>Por hora</b><span>Mostramos uma referência do peso do prompt no contexto estimado. Isso ajuda a ter ideia de quanto daquele orçamento vai embora numa execução.</span></div>
+            <div class="helpitem"><b>Plano econômico</b><span>O comparativo já aponta qual modelo e qual velocidade gastam menos, então você decide pelo menor custo sem abrir menu demais.</span></div>
+            <div class="helpitem"><b>Limite real</b><span>Se depois você quiser saldo real, aí a conversa muda para autenticação e billing. Por enquanto, a estimativa proporcional resolve bem.</span></div>
+        </div>
+    </section>
+
+    <section class="results" id="results"><div class="card empty">Cole o prompt e a URL do repositório para ver a recomendação automática e a tabela comparativa.</div></section>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
 const fmt = new Intl.NumberFormat('pt-BR');
+$('helpBtn').addEventListener('click', () => $('helpBox').classList.toggle('open'));
 $('analyzeBtn').addEventListener('click', analyze);
-async function analyze(){
+
+async function analyze() {
     const btn = $('analyzeBtn');
-    const results = $('results');
     btn.disabled = true;
-    btn.textContent = 'Analisando repo e estimando tokens...';
-    results.innerHTML = `<div class="card empty">Buscando árvore do GitHub, escolhendo arquivos prováveis e fazendo a continha que as plataformas fingem que não seria útil. Segura essa ansiedade.</div>`;
-    const payload = {
-        repo_url: $('repo').value.trim(),
-        branch: $('branch').value.trim(),
-        prompt: $('prompt').value.trim(),
-        task_size: $('taskSize').value,
-        max_files: parseInt($('maxFiles').value || '18', 10),
-        github_token: $('githubToken').value.trim(),
-        include_agents: $('includeAgents').checked,
-        speed_normal: parseFloat($('speedNormal').value || '1'),
-        speed_fast: parseFloat($('speedFast').value || '1.5'),
-        speed_turbo: parseFloat($('speedTurbo').value || '2'),
-    };
-    try{
-        const response = await fetch('?action=analyze', {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    btn.textContent = 'Analisando...';
+    $('results').innerHTML = `<div class="card empty">Lendo o repositório, entendendo o prompt e escolhendo o caminho mais barato.</div>`;
+    try {
+        const response = await fetch('?action=analyze', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                repo_url: $('repo').value.trim(),
+                prompt: $('prompt').value.trim(),
+                github_token: ''
+            })
+        });
         const data = await response.json();
-        if(!data.ok) throw new Error(data.error || 'Erro desconhecido.');
+        if (!data.ok) throw new Error(data.error || 'Erro desconhecido.');
         render(data.result);
-    }catch(err){
-        results.innerHTML = `<div class="card panel"><div class="error"><b>Deu ruim:</b><br>${escapeHtml(err.message)}</div></div>`;
-    }finally{
+    } catch (err) {
+        $('results').innerHTML = `<div class="card panel"><div class="badge red">Erro</div><p>${escapeHtml(err.message)}</p></div>`;
+    } finally {
         btn.disabled = false;
-        btn.textContent = 'Analisar antes de dar play';
+        btn.textContent = 'Analisar custo mínimo';
     }
 }
-function render(r){
+
+function render(r) {
     const rec = r.recommendation || {};
     const riskClass = rec.risk === 'alto' ? 'red' : (rec.risk === 'médio' ? 'yellow' : 'green');
-    const realisticNormal = r.comparisons.filter(x => x.scenario === 'realista' && x.speed === 'normal').sort((a,b) => a.credits - b.credits);
-    const allRows = r.comparisons.filter(x => x.scenario === 'realista').sort((a,b) => a.credits - b.credits);
+    const normal = (r.comparisons || []).filter(x => x.scenario === 'realista' && x.speed === 'normal').sort((a, b) => a.credits - b.credits);
+    const allRows = (r.comparisons || []).filter(x => x.scenario === 'realista').sort((a, b) => a.credits - b.credits);
     const maxCredits = Math.max(...allRows.map(x => x.credits), 1);
-    const fileRows = r.selected_files.sort((a,b) => b.tokens - a.tokens).map(f => `<tr><td><code>${escapeHtml(f.path)}</code><div class="muted">${escapeHtml(f.note || '')}</div></td><td class="right">${fmt.format(f.tokens)}</td><td class="right">${fmt.format(f.size)} B</td><td class="right">${fmt.format(f.score)}</td></tr>`).join('');
+    const directRows = normal.map(c => `<tr><td><b>${escapeHtml(c.model)}</b></td><td class="right">${fmt.format(c.total_tokens)}</td><td class="right"><b>${fmt.format(c.credits)}</b></td></tr>`).join('');
     const compareRows = allRows.map(c => `<tr><td><b>${escapeHtml(c.model)}</b></td><td>${labelSpeed(c.speed)}</td><td class="right">${fmt.format(c.input_tokens)}</td><td class="right">${fmt.format(c.output_tokens)}</td><td class="right"><b>${fmt.format(c.credits)}</b></td><td><div class="bar"><i style="width:${Math.min(100, (c.credits / maxCredits) * 100)}%"></i></div></td></tr>`).join('');
-    const directRows = realisticNormal.map(c => `<tr><td><b>${escapeHtml(c.model)}</b></td><td class="right">${fmt.format(c.total_tokens)}</td><td class="right"><b>${fmt.format(c.credits)}</b></td></tr>`).join('');
     $('results').innerHTML = `
-        <div class="card panel"><div class="recommend"><div><span class="badge ${riskClass}">risco ${escapeHtml(rec.risk || 'baixo')}</span><h3>Recomendação: ${escapeHtml(rec.recommended_model || 'GPT-5.4-mini')}</h3><p>${escapeHtml(rec.reason || '')}</p></div><div class="badge green">${escapeHtml(r.repo)} · ${escapeHtml(r.branch)}</div></div></div>
-        <div class="summary"><div class="metric"><small>Prompt</small><b>${fmt.format(r.prompt_tokens)}</b><small>tokens estimados</small></div><div class="metric"><small>Arquivos prováveis</small><b>${fmt.format(r.file_tokens)}</b><small>tokens estimados</small></div><div class="metric"><small>Entrada direta</small><b>${fmt.format(r.input_tokens_direct)}</b><small>prompt + arquivos</small></div><div class="metric"><small>Saída prevista</small><b>${fmt.format(r.output_tokens_estimated)}</b><small>resposta/diff estimado</small></div></div>
-        <div class="card panel"><h2>Comparativo rápido em velocidade normal</h2><div class="scroll"><table><thead><tr><th>Modelo</th><th class="right">Tokens totais</th><th class="right">Créditos realistas</th></tr></thead><tbody>${directRows}</tbody></table></div></div>
-        <div class="card panel"><h2>Comparativo por modelo + velocidade</h2><div class="scroll"><table><thead><tr><th>Modelo</th><th>Velocidade</th><th class="right">Entrada</th><th class="right">Saída</th><th class="right">Créditos</th><th>peso</th></tr></thead><tbody>${compareRows}</tbody></table></div><p class="footer-note">Tabela usa o cenário realista: entrada direta + 30% para arquivos extras que o agente pode abrir.</p></div>
-        <div class="card panel"><h2>Arquivos prováveis que entram no contexto</h2><div class="scroll"><table><thead><tr><th>Arquivo</th><th class="right">Tokens</th><th class="right">Tamanho</th><th class="right">Score</th></tr></thead><tbody>${fileRows}</tbody></table></div><p class="footer-note">Candidatos encontrados: ${fmt.format(r.total_candidate_files)}. Se a lista parece errada, deixe o prompt mais específico ou reduza/aumente o máximo de arquivos.</p></div>
-        <div class="card panel"><h2>Prompt econômico sugerido</h2><button class="copybtn" onclick="copyPrompt()">Copiar prompt</button><pre class="copybox" id="optimizedPrompt">${escapeHtml(r.optimized_prompt)}</pre><p class="footer-note">${escapeHtml(r.accuracy_note)} ${escapeHtml(r.rates_source_note)}</p></div>`;
+        <div class="card panel">
+            <div class="recommend">
+                <div>
+                    <div class="badge ${riskClass}">risco ${escapeHtml(rec.risk || 'baixo')}</div>
+                    <h2 style="margin:10px 0 6px;">${escapeHtml(rec.recommended_model || 'GPT-5.4-mini')}</h2>
+                    <p class="muted" style="margin:0;">${escapeHtml(rec.reason || '')}</p>
+                </div>
+                <div class="badge green">${escapeHtml((r.task_type && r.task_type.type) || 'general')}</div>
+            </div>
+        </div>
+        <div class="summary">
+            <div class="metric"><small>Prompt</small><b>${fmt.format(r.prompt_tokens || 0)}</b><small>tokens estimados</small></div>
+            <div class="metric"><small>Contexto</small><b>${fmt.format(r.input_tokens_direct || 0)}</b><small>prompt + arquivos</small></div>
+            <div class="metric"><small>Saída prevista</small><b>${fmt.format(r.output_tokens_estimated || 0)}</b><small>resposta/diff estimado</small></div>
+            <div class="metric"><small>Tipo</small><b>${escapeHtml((r.task_type && r.task_type.type) || 'general')}</b><small>detectado automaticamente</small></div>
+        </div>
+        <div class="card panel">
+            <h2>Comparativo rápido em velocidade normal</h2>
+            <div class="scroll">
+                <table>
+                    <thead><tr><th>Modelo</th><th class="right">Tokens totais</th><th class="right">Créditos realistas</th></tr></thead>
+                    <tbody>${directRows}</tbody>
+                </table>
+            </div>
+        </div>
+        <div class="card panel">
+            <h2>Comparativo por modelo + velocidade</h2>
+            <div class="scroll">
+                <table>
+                    <thead><tr><th>Modelo</th><th>Velocidade</th><th class="right">Entrada</th><th class="right">Saída</th><th class="right">Créditos</th><th>peso</th></tr></thead>
+                    <tbody>${compareRows}</tbody>
+                </table>
+            </div>
+        </div>
+        <div class="card panel">
+            <h2>Resumo por hora</h2>
+            <p class="footer-note" style="font-size:14px;color:#d9deea;margin-top:0;">${escapeHtml(r.hourly_context_note || '')}</p>
+            <p class="footer-note">${escapeHtml(r.accuracy_note || '')}</p>
+        </div>
+    `;
 }
-function labelSpeed(speed){if(speed === 'normal') return '<span class="badge green">Normal</span>'; if(speed === 'fast') return '<span class="badge yellow">Fast</span>'; return '<span class="badge red">Turbo</span>';}
-function copyPrompt(){navigator.clipboard.writeText($('optimizedPrompt').innerText);}
-function escapeHtml(str){return String(str ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));}
+
+function labelSpeed(speed) {
+    if (speed === 'normal') return '<span class="badge green">Normal</span>';
+    if (speed === 'fast') return '<span class="badge yellow">Fast</span>';
+    return '<span class="badge red">Turbo</span>';
+}
+
+function escapeHtml(str) {
+    return String(str ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
+}
 </script>
 </body>
 </html>
