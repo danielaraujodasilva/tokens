@@ -153,16 +153,19 @@ function detect_task_type(string $prompt, string $repo, array $tree): array
         ['type' => 'diagnostic', 'size' => 'medium', 'terms' => ['investigue', 'descubra', 'diagnostique', 'analise', 'análise', 'por que', 'porque', 'onde está', 'onde esta'], 'paths' => []],
     ];
     foreach ($rules as $rule) {
-        $score = 0;
+        $promptScore = 0;
+        $repoScore = 0;
         foreach ($rule['terms'] as $term) {
-            if (str_contains($p, $term)) $score += 3;
-            if (str_contains($hay, $term)) $score += 1;
+            if (str_contains($p, $term)) $promptScore += 3;
+            if (str_contains($hay, $term)) $repoScore += 1;
         }
         foreach ($rule['paths'] as $term) {
-            if (str_contains($r, $term)) $score += 2;
-            if (str_contains($hay, $term)) $score += 1;
+            if (str_contains($r, $term)) $repoScore += 2;
+            if (str_contains($hay, $term)) $repoScore += 1;
         }
-        if ($score >= 5) return ['type' => $rule['type'], 'size' => $rule['size'], 'confidence' => min(0.97, 0.42 + ($score * 0.06))];
+        if ($promptScore >= 3 && ($promptScore + $repoScore) >= 5) {
+            return ['type' => $rule['type'], 'size' => $rule['size'], 'confidence' => min(0.97, 0.38 + (($promptScore + $repoScore) * 0.06))];
+        }
     }
 
     $complexity = 0;
@@ -183,6 +186,7 @@ function detect_task_type(string $prompt, string $repo, array $tree): array
 
     $hasMoreThanOneArea = 0;
     foreach (['php', 'js', 'css', 'html', 'sql', 'api', 'webhook', 'deploy', 'whatsapp', 'bot', 'cron'] as $needle) {
+        if (str_contains($p, $needle)) $hasMoreThanOneArea += 2;
         if (str_contains($hay, $needle)) $hasMoreThanOneArea++;
     }
     if ($hasMoreThanOneArea >= 4) $complexity += 2;
@@ -191,6 +195,7 @@ function detect_task_type(string $prompt, string $repo, array $tree): array
     if ($complexity >= 5) return ['type' => 'backend/php', 'size' => 'medium', 'confidence' => 0.58];
     if ($complexity >= 2) return ['type' => 'bugfix', 'size' => 'small', 'confidence' => 0.52];
 
+    if ($complexity <= -1) return ['type' => 'general', 'size' => 'tiny', 'confidence' => 0.35];
     return ['type' => 'general', 'size' => 'medium', 'confidence' => 0.45];
 }
 
@@ -308,15 +313,53 @@ function build_recommendation(array $comparisons, array $taskType, int $inputTok
     $normal = array_values(array_filter($comparisons, fn($c) => $c['scenario'] === 'realista' && $c['speed'] === 'normal'));
     usort($normal, fn($a, $b) => $a['credits'] <=> $b['credits']);
     $best = $normal[0] ?? null;
-    $risk = $taskType['size'] === 'large' || $inputTokens > 120000 ? 'médio' : 'baixo';
+    $type = (string)($taskType['type'] ?? 'general');
+    $size = (string)($taskType['size'] ?? 'medium');
+    $confidence = (float)($taskType['confidence'] ?? 0.45);
+    $risk = $size === 'large' || $inputTokens > 120000 ? 'médio' : 'baixo';
+
     $recommended = 'GPT-5.4-mini';
-    if (($taskType['type'] ?? '') === 'webhook/deploy') $recommended = 'GPT-5.4-mini';
-    elseif (($taskType['type'] ?? '') === 'database' || ($taskType['type'] ?? '') === 'automation') $recommended = 'GPT-5.3-Codex';
-    elseif ($inputTokens > 180000) { $recommended = 'GPT-5.3-Codex'; $risk = 'alto'; }
+
+    if ($size === 'tiny' && $confidence >= 0.55) {
+        $recommended = 'GPT-5.4-mini';
+    } elseif ($size === 'small' && $confidence >= 0.55) {
+        $recommended = 'GPT-5.4-mini';
+    } elseif ($type === 'backend/php' || $type === 'bugfix') {
+        $recommended = $confidence >= 0.62 ? 'GPT-5.3-Codex' : 'GPT-5.4-mini';
+    } elseif ($type === 'database' || $type === 'automation' || $type === 'refactor') {
+        $recommended = 'GPT-5.3-Codex';
+    } elseif ($type === 'diagnostic') {
+        $recommended = $inputTokens > 50000 ? 'GPT-5.5' : 'GPT-5.3-Codex';
+        $risk = $inputTokens > 50000 ? 'médio' : 'baixo';
+    } elseif ($type === 'frontend/ui') {
+        $recommended = $confidence >= 0.7 || $inputTokens > 45000 ? 'GPT-5.3-Codex' : 'GPT-5.4-mini';
+    } elseif ($type === 'webhook/deploy') {
+        $recommended = $confidence >= 0.65 ? 'GPT-5.4-mini' : 'GPT-5.3-Codex';
+    } elseif ($inputTokens > 180000) {
+        $recommended = 'GPT-5.3-Codex';
+        $risk = 'alto';
+    } elseif ($inputTokens > 90000) {
+        $recommended = 'GPT-5.3-Codex';
+    } elseif ($inputTokens > 45000 && $confidence < 0.58) {
+        $recommended = 'GPT-5.3-Codex';
+    }
+
+    if ($type === 'refactor' && $inputTokens > 120000) {
+        $recommended = 'GPT-5.5';
+        $risk = 'alto';
+    }
+
+    if ($confidence < 0.5 && $inputTokens > 30000) {
+        $risk = $risk === 'alto' ? 'alto' : 'médio';
+        if ($recommended === 'GPT-5.4-mini') {
+            $recommended = 'GPT-5.3-Codex';
+        }
+    }
+
     return [
         'recommended_model' => $recommended,
         'risk' => $risk,
-        'reason' => 'Tipo detectado: ' . ($taskType['type'] ?? 'general') . '. O comparativo abaixo já mostra o menor custo estimado.',
+        'reason' => 'Tipo detectado: ' . $type . ' · confiança ' . number_format($confidence * 100, 0) . '%. O comparativo abaixo mostra o menor custo estimado, mas a recomendação já sobe quando a tarefa parece maior ou mais ambígua.',
         'best_cheapest_realistic_normal' => $best,
         'selected_file_count' => count($comparisons),
     ];
@@ -356,7 +399,7 @@ function build_optimized_prompt(string $prompt, array $selected, string $model):
     <style>
         :root{--bg:#09090d;--panel:#11111a;--muted:#9ba0ad;--text:#f5f7fb;--line:rgba(255,255,255,.10);--red:#ff3b5f;--green:#36d399;--yellow:#fbbf24;--blue:#60a5fa;--shadow:0 24px 70px rgba(0,0,0,.45);--radius:18px}
         *{box-sizing:border-box} body{margin:0;min-height:100vh;background:linear-gradient(135deg,#07070a,#11111a 45%,#09090d);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,sans-serif}
-        .wrap{max-width:1180px;margin:0 auto;padding:28px 18px 64px}.hero{display:grid;grid-template-columns:1.2fr .8fr;gap:18px;margin-bottom:18px}.card{background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.025));border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}.hero-main{padding:30px}.eyebrow{display:inline-flex;padding:7px 12px;border-radius:999px;border:1px solid rgba(255,59,95,.35);background:rgba(255,59,95,.12);color:#ffd3dc;font-size:13px;font-weight:700}.hero h1{font-size:clamp(32px,4vw,54px);line-height:1.02;margin:16px 0 12px}.lead{color:#c8ccd8;font-size:18px;line-height:1.5;margin:0}.hero-side{padding:18px;display:flex;flex-direction:column;gap:12px}.mini-stat{padding:16px;border:1px solid var(--line);border-radius:16px;background:rgba(0,0,0,.22)}.mini-stat b{display:block;font-size:24px;margin-bottom:4px}.mini-stat span{color:var(--muted);font-size:13px}.form{padding:20px;display:grid;gap:14px}.row{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:end}label{display:block;font-weight:800;font-size:13px;margin:0 0 8px}input,textarea{width:100%;border:1px solid var(--line);background:#0b0b12;color:var(--text);border-radius:14px;padding:13px 14px;font:inherit}.textarea{min-height:160px;resize:vertical}.actions{display:flex;gap:10px;flex-wrap:wrap}.btn,.help-toggle{border:0;border-radius:16px;padding:13px 16px;font-weight:900;cursor:pointer}.btn{background:linear-gradient(135deg,var(--red),#7c3aed);color:#fff;box-shadow:0 14px 35px rgba(255,59,95,.22)}.help-toggle{background:rgba(255,255,255,.06);color:var(--text);border:1px solid var(--line)}.results{display:flex;flex-direction:column;gap:16px;margin-top:18px}.panel{padding:20px}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.metric{padding:16px;border:1px solid var(--line);border-radius:16px;background:rgba(0,0,0,.24)}.metric small{display:block;color:var(--muted);font-size:12px}.metric b{display:block;font-size:22px;margin-top:6px}.badge{display:inline-flex;padding:7px 10px;border-radius:999px;border:1px solid var(--line);font-size:12px;font-weight:900}.badge.green{color:#b9f8dc;background:rgba(54,211,153,.12)}.badge.yellow{color:#fff1b8;background:rgba(251,191,36,.12)}.badge.red{color:#ffd0d8;background:rgba(255,59,95,.12)}.recommend{display:flex;justify-content:space-between;gap:12px;align-items:start;padding:18px;border-radius:18px;border:1px solid var(--line);background:rgba(0,0,0,.24)}.scroll{overflow:auto;border:1px solid var(--line);border-radius:16px}.bar{height:9px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden;min-width:110px}.bar i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--green),var(--yellow),var(--red))}table{width:100%;border-collapse:collapse}th,td{padding:12px 10px;border-bottom:1px solid var(--line);text-align:left;font-size:14px}th{color:#dce0ea;font-size:12px;text-transform:uppercase;letter-spacing:.06em;background:rgba(255,255,255,.04)}.muted{color:var(--muted)}.helpbox{display:none;padding:18px}.helpbox.open{display:block}.helpgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.helpitem{padding:16px;border:1px solid var(--line);border-radius:16px;background:rgba(0,0,0,.22)}.helpitem b{display:block;margin-bottom:6px}.helpitem span{color:var(--muted);font-size:13px;line-height:1.45}.empty{padding:30px;text-align:center;color:var(--muted)}.footer-note{color:var(--muted);font-size:12px;line-height:1.45;margin-top:12px}@media(max-width:900px){.hero,.summary,.helpgrid{grid-template-columns:1fr}.row{grid-template-columns:1fr}.lead{font-size:16px}}
+        .wrap{max-width:1180px;margin:0 auto;padding:28px 18px 64px}.hero{display:grid;grid-template-columns:1.2fr .8fr;gap:18px;margin-bottom:18px}.card{background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.025));border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}.hero-main{padding:30px}.eyebrow{display:inline-flex;padding:7px 12px;border-radius:999px;border:1px solid rgba(255,59,95,.35);background:rgba(255,59,95,.12);color:#ffd3dc;font-size:13px;font-weight:700}.hero h1{font-size:clamp(32px,4vw,54px);line-height:1.02;margin:16px 0 12px}.lead{color:#c8ccd8;font-size:18px;line-height:1.5;margin:0}.hero-side{padding:18px;display:flex;flex-direction:column;gap:12px}.mini-stat{padding:16px;border:1px solid var(--line);border-radius:16px;background:rgba(0,0,0,.22)}.mini-stat b{display:block;font-size:24px;margin-bottom:4px}.mini-stat span{color:var(--muted);font-size:13px}.form{padding:20px;display:grid;gap:14px}.row{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:end}label{display:block;font-weight:800;font-size:13px;margin:0 0 8px}input,textarea{width:100%;border:1px solid var(--line);background:#0b0b12;color:var(--text);border-radius:14px;padding:13px 14px;font:inherit}.textarea{min-height:160px;resize:vertical}.actions{display:flex;gap:10px;flex-wrap:wrap}.btn,.help-toggle{border:0;border-radius:16px;padding:13px 16px;font-weight:900;cursor:pointer}.btn{background:linear-gradient(135deg,var(--red),#7c3aed);color:#fff;box-shadow:0 14px 35px rgba(255,59,95,.22)}.help-toggle{background:rgba(255,255,255,.06);color:var(--text);border:1px solid var(--line)}.loading{display:none;padding-top:6px}.loading.open{display:block}.loading-head{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:8px;font-size:13px;font-weight:800;color:#dfe5f2}.loading-bar{height:10px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden;border:1px solid var(--line)}.loading-bar i{display:block;height:100%;width:0%;border-radius:999px;background:linear-gradient(90deg,var(--green),var(--yellow),var(--red));transition:width .22s ease}.loading.pulse .loading-bar i{animation:pulse 1.1s ease-in-out infinite}@keyframes pulse{0%,100%{opacity:.85}50%{opacity:1}}.results{display:flex;flex-direction:column;gap:16px;margin-top:18px}.panel{padding:20px}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.metric{padding:16px;border:1px solid var(--line);border-radius:16px;background:rgba(0,0,0,.24)}.metric small{display:block;color:var(--muted);font-size:12px}.metric b{display:block;font-size:22px;margin-top:6px}.badge{display:inline-flex;padding:7px 10px;border-radius:999px;border:1px solid var(--line);font-size:12px;font-weight:900}.badge.green{color:#b9f8dc;background:rgba(54,211,153,.12)}.badge.yellow{color:#fff1b8;background:rgba(251,191,36,.12)}.badge.red{color:#ffd0d8;background:rgba(255,59,95,.12)}.recommend{display:flex;justify-content:space-between;gap:12px;align-items:start;padding:18px;border-radius:18px;border:1px solid var(--line);background:rgba(0,0,0,.24)}.scroll{overflow:auto;border:1px solid var(--line);border-radius:16px}.bar{height:9px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden;min-width:110px}.bar i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--green),var(--yellow),var(--red))}table{width:100%;border-collapse:collapse}th,td{padding:12px 10px;border-bottom:1px solid var(--line);text-align:left;font-size:14px}th{color:#dce0ea;font-size:12px;text-transform:uppercase;letter-spacing:.06em;background:rgba(255,255,255,.04)}.muted{color:var(--muted)}.helpbox{display:none;padding:18px}.helpbox.open{display:block}.helpgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.helpitem{padding:16px;border:1px solid var(--line);border-radius:16px;background:rgba(0,0,0,.22)}.helpitem b{display:block;margin-bottom:6px}.helpitem span{color:var(--muted);font-size:13px;line-height:1.45}.empty{padding:30px;text-align:center;color:var(--muted)}.footer-note{color:var(--muted);font-size:12px;line-height:1.45;margin-top:12px}@media(max-width:900px){.hero,.summary,.helpgrid{grid-template-columns:1fr}.row{grid-template-columns:1fr}.lead{font-size:16px}.loading-head{flex-direction:column;align-items:flex-start}}
     </style>
 </head>
 <body>
@@ -386,6 +429,13 @@ function build_optimized_prompt(string $prompt, array $selected, string $model):
         <div class="actions">
             <button class="btn" id="analyzeBtn">Analisar custo mínimo</button>
             <button class="help-toggle" id="helpBtn" type="button">Como ler os créditos</button>
+        </div>
+        <div class="loading" id="loadingState" aria-live="polite">
+            <div class="loading-head">
+                <span id="loadingPercent">0%</span>
+                <span id="loadingText">Pronto para analisar.</span>
+            </div>
+            <div class="loading-bar"><i id="loadingBar"></i></div>
         </div>
     </section>
 
@@ -418,10 +468,14 @@ $('analyzeBtn').addEventListener('click', analyze);
 
 async function analyze() {
     const btn = $('analyzeBtn');
+    const loading = $('loadingState');
     btn.disabled = true;
     btn.textContent = 'Analisando...';
+    loading.classList.add('open', 'pulse');
+    setLoading(8, 'Preparando a leitura do repositório...');
     $('results').innerHTML = `<div class="card empty">Lendo o repositório, entendendo o prompt e escolhendo o caminho mais barato.</div>`;
     try {
+        setLoading(24, 'Consultando a árvore de arquivos...');
         const response = await fetch('?action=analyze', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
@@ -431,15 +485,30 @@ async function analyze() {
                 github_token: ''
             })
         });
+        setLoading(64, 'Estimando contexto, complexidade e custo...');
         const data = await response.json();
         if (!data.ok) throw new Error(data.error || 'Erro desconhecido.');
+        setLoading(90, 'Montando o comparativo final...');
         render(data.result);
+        setLoading(100, 'Resultado pronto.');
     } catch (err) {
         $('results').innerHTML = `<div class="card panel"><div class="badge red">Erro</div><p>${escapeHtml(err.message)}</p></div>`;
+        setLoading(100, 'Falha ao carregar o resultado.');
     } finally {
         btn.disabled = false;
         btn.textContent = 'Analisar custo mínimo';
+        setTimeout(() => {
+            loading.classList.remove('open', 'pulse');
+            setLoading(0, 'Pronto para analisar.');
+        }, 400);
     }
+}
+
+function setLoading(percent, text) {
+    const value = Math.max(0, Math.min(100, percent));
+    $('loadingBar').style.width = `${value}%`;
+    $('loadingPercent').textContent = `${value}%`;
+    $('loadingText').textContent = text;
 }
 
 function render(r) {
@@ -458,7 +527,10 @@ function render(r) {
                     <h2 style="margin:10px 0 6px;">${escapeHtml(rec.recommended_model || 'GPT-5.4-mini')}</h2>
                     <p class="muted" style="margin:0;">${escapeHtml(rec.reason || '')}</p>
                 </div>
-                <div class="badge green">${escapeHtml((r.task_type && r.task_type.type) || 'general')}</div>
+                <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-end;">
+                    <div class="badge green">${escapeHtml((r.task_type && r.task_type.type) || 'general')}</div>
+                    <div class="badge">${Math.round(((r.task_type && r.task_type.confidence) || 0) * 100)}% confiança</div>
+                </div>
             </div>
         </div>
         <div class="summary">
